@@ -16,7 +16,6 @@ throttle_decay = 0.05         # ลดความเร็วเมื่อป
 
 while True:
     joyVal = jsM.getJS()
-    print(joyVal)
 
     steering = joyVal['RX'] * max_Turning_speed
     target_throttle = joyVal['LY'] * maxThrottle  # ค่าที่ต้องการไปถึง
@@ -43,6 +42,6 @@ while True:
         record = 0
 
     # ส่งค่าไปมอเตอร์
-    motor.move(-current_throttle, steering)
+    motor.move(current_throttle, steering)
 
     cv2.waitKey(1)
