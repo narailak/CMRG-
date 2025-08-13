@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import RPi.GPIO as GPIO
-import cv2
-from time import sleep
 import sys
 import signal
 import time
+from time import sleep
 
-# โมดูลของคุณ
+import RPi.GPIO as GPIO
+import cv2
+
+# --------- โมดูลของคุณ ----------
 import WebcamModule as wM
 import DataCollectionModule as dcM
 import Joynew as jsM
 import MotorModule as mM
 
 # ------------------ CONFIG ------------------
-RUN_SWITCH = 23            # BCM23 (ขา 16)
-SLEEP_IDLE = 0.02          # หน่วงตอนสวิตช์ OFF
-SWITCH_CHECK_INTERVAL = 0.01  # ตรวจสวิตช์ทุก 10ms
+RUN_SWITCH = 23               # BCM23 (ขา 16), ON=LOW, OFF=HIGH (ใช้ PULL-UP ภายใน)
+SLEEP_IDLE = 0.02             # เวลาพักตอน OFF
+DEBOUNCE_MS = 100             # หน่วงกันเด้ง 100 ms
 
 maxThrottle = 0.4
 max_Turning_speed = 0.4
@@ -25,36 +26,25 @@ throttle_step = 0.02
 throttle_decay = 0.05
 
 # ------------------ STATE -------------------
-stop_now = False
-last_switch_state = False
-switch_off_time = 0
+exiting = False
 
 # ------------------ GPIO SETUP --------------
 def setup_gpio():
-    """Setup GPIO pins safely"""
-    try:
-        GPIO.cleanup()  # ทำความสะอาดก่อน
-        sleep(0.2)      # รอให้เสร็จ
-        
-        GPIO.setmode(GPIO.BCM)
-        GPIO.setup(RUN_SWITCH, GPIO.IN, pull_up_down=GPIO.PUD_UP)  # ON=LOW, OFF=HIGH
-        print("GPIO setup completed (polling mode)")
-        return True
-    except Exception as e:
-        print(f"GPIO setup failed: {e}")
-        return False
+    # อย่า cleanup ที่นี่ (จะทำให้เตือน/รีเซ็ตขาโดยไม่จำเป็น)
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setwarnings(False)
+    GPIO.setup(RUN_SWITCH, GPIO.IN, pull_up_down=GPIO.PUD_UP)  # ON = LOW
+    print("[GPIO] Setup completed (polling + debounce).")
 
 # ------------------ HELPERS -----------------
-def stop_motor_safely():
-    """หยุดมอเตอร์อย่างปลอดภัย"""
+def stop_motor_safely(motor=None):
     try:
-        if 'motor' in globals():
+        if motor is not None:
             motor.move(0.0, 0.0)
     except Exception as e:
-        print(f"Error stopping motor: {e}")
+        print(f"[WARN] stop motor: {e}")
 
 def close_cv_windows_safely(names=("IMG", "Trackbars")):
-    """ปิดหน้าต่าง OpenCV ให้ปลอดภัย"""
     try:
         cv2.waitKey(1)
         for name in names:
@@ -64,140 +54,106 @@ def close_cv_windows_safely(names=("IMG", "Trackbars")):
             except cv2.error:
                 pass
         cv2.destroyAllWindows()
-    except cv2.error as e:
-        print(f"[WARN] OpenCV error while closing windows: {e}")
     except Exception as e:
-        print(f"[WARN] Unexpected error while closing windows: {e}")
+        print(f"[WARN] cv close: {e}")
 
-def switch_is_on():
-    """สวิตช์ ON = ต่อ GND -> LOW"""
-    try:
-        return GPIO.input(RUN_SWITCH) == GPIO.LOW
-    except Exception as e:
-        print(f"Error reading switch: {e}")
-        return False
+def _stable_read(target_low=True, hold_ms=DEBOUNCE_MS):
+    """
+    อ่านสวิตช์ให้ 'นิ่ง' อย่างน้อย hold_ms:
+    - target_low=True ต้องนิ่งที่ LOW (ON)
+    - target_low=False ต้องนิ่งที่ HIGH (OFF)
+    """
+    want = GPIO.LOW if target_low else GPIO.HIGH
+    t0 = time.time()
+    while True:
+        if GPIO.input(RUN_SWITCH) != want:
+            t0 = time.time()  # รีสตาร์ทจับเวลาเมื่อหลุด
+        if (time.time() - t0) * 1000.0 >= hold_ms:
+            return True
+        if exiting:
+            return False
+        sleep(0.005)
 
-def check_switch_with_debounce():
-    """ตรวจสวิตช์พร้อม debounce แบบ polling"""
-    global last_switch_state, switch_off_time, stop_now
-    
-    current_state = switch_is_on()
-    current_time = time.time()
-    
-    # ตรวจสอบการเปลี่ยนจาก ON -> OFF
-    if last_switch_state and not current_state:
-        switch_off_time = current_time
-        print("[SWITCH] OFF detected -> Emergency STOP")
-        stop_now = True
-        stop_motor_safely()
-        close_cv_windows_safely()
-    
-    # ตรวจสอบการเปลี่ยนจาก OFF -> ON
-    elif not last_switch_state and current_state:
-        # debounce: รอให้สวิตช์เสียงหาย
-        if current_time - switch_off_time > 0.1:  # debounce 100ms
-            print("[SWITCH] ON detected")
-            stop_now = False
-    
-    last_switch_state = current_state
-    return current_state
+def wait_for_switch_on():
+    """รอจน ON แบบนิ่งต่อเนื่อง DEBOUNCE_MS"""
+    while not exiting:
+        if GPIO.input(RUN_SWITCH) == GPIO.LOW:
+            if _stable_read(target_low=True, hold_ms=DEBOUNCE_MS):
+                return True
+        sleep(SLEEP_IDLE)
+    return False
 
-def cleanup_and_exit(signum=None, frame=None):
-    """ทำความสะอาดและออกจากโปรแกรม"""
-    global stop_now
-    stop_now = True
-    print("\nCleaning up and exiting...")
-    
-    # หยุดมอเตอร์
-    stop_motor_safely()
-    
-    # ปิดหน้าต่าง OpenCV
-    close_cv_windows_safely()
-    
-    # ทำความสะอาด GPIO
-    try:
-        GPIO.cleanup()
-    except Exception:
-        pass
-    
-    print("Clean exit completed.")
-    sys.exit(0)
+def is_switch_off_stable():
+    """เช็คว่า OFF แบบนิ่งต่อเนื่อง DEBOUNCE_MS"""
+    if GPIO.input(RUN_SWITCH) == GPIO.HIGH:
+        return _stable_read(target_low=False, hold_ms=DEBOUNCE_MS)
+    return False
 
-# ------------------ REGISTER SIGNAL HANDLERS -------
-signal.signal(signal.SIGINT, cleanup_and_exit)   # Ctrl+C
-signal.signal(signal.SIGTERM, cleanup_and_exit)  # Termination
+# ------------------ SIGNAL HANDLERS ----------------
+def _sig_handler(signum, frame):
+    global exiting
+    exiting = True
+signal.signal(signal.SIGINT, _sig_handler)
+signal.signal(signal.SIGTERM, _sig_handler)
 
-# ------------------ MAIN PROGRAM ---------------
+# ------------------ MAIN -------------------
 def main():
-    global motor, stop_now, last_switch_state
-    
-    # Setup GPIO
-    if not setup_gpio():
-        print("Failed to setup GPIO. Exiting.")
-        return
-    
-    # Initialize motor
+    global exiting
+    setup_gpio()
+    print("วิธี A: init มอเตอร์ครั้งเดียว ใช้ซ้ำทุกครั้งที่ ON (Debounce 100ms)")
+    print("Ctrl+C เพื่อออกโปรแกรม")
+
+    motor = None
+
+    # === สร้างมอเตอร์ครั้งเดียว ===
     try:
-        motor = mM.Motor(13, 5, 6, 18, 27, 22)
-        print("Motor initialized")
+        motor = mM.Motor(13, 5, 6, 18, 27, 22)  # L: ENA,IN1,IN2 / R: ENA,IN1,IN2
+        print("[MOTOR] Initialized (one-time).")
     except Exception as e:
-        print(f"Failed to initialize motor: {e}")
-        cleanup_and_exit()
+        print(f"[ERROR] Motor init failed: {e}")
+        GPIO.cleanup()
         return
-    
-    # Initialize switch state
-    last_switch_state = switch_is_on()
-    
+
     try:
-        print("ระบบพร้อม: สวิตช์ ON เพื่อเริ่ม, OFF เพื่อหยุดทันที (Polling Mode)")
-        print("กด Ctrl+C เพื่อออกจากโปรแกรม")
-
-        while not stop_now:
-            # -------- ตรวจสอบสวิตช์ --------
-            switch_on = check_switch_with_debounce()
-            
-            # -------- รอจนกว่าจะเปิดสวิตช์ --------
-            while not switch_on and not stop_now:
-                stop_motor_safely()
-                sleep(SLEEP_IDLE)
-                switch_on = check_switch_with_debounce()
-
-            if stop_now:
+        while not exiting:
+            # ---------- รอจนกว่าจะเปิดสวิตช์ (นิ่งจริง) ----------
+            if not wait_for_switch_on():
+                break
+            if exiting:
                 break
 
-            # -------- เริ่มทำงานใหม่จากต้น --------
-            print("[SWITCH] ON -> Start Program Fresh")
+            print("[SWITCH] ON -> Start running...")
 
-            # รีเซ็ตตัวแปรทุกครั้งที่เริ่มใหม่
+            # ---------- รีเซ็ตตัวแปรวิ่ง ----------
             current_throttle = 0.0
             record = 0
-            loop_count = 0
+            no_js_warned = False
 
-            # ลูปการทำงานปกติ
-            while not stop_now:
-                loop_count += 1
-                
-                # ตรวจสวิตช์ทุก 10 loops (ประมาณทุก 50-100ms)
-                if loop_count % 10 == 0:
-                    switch_on = check_switch_with_debounce()
-                    if not switch_on:
-                        break
-                
+            # ---------- ลูปทำงานหลักเมื่อสวิตช์ ON ----------
+            while not exiting:
+                # ออกเมื่อ OFF นิ่งจริง
+                if is_switch_off_stable():
+                    break
+
                 try:
                     joyVal = jsM.getJS() or {}
+                    if not joyVal and not no_js_warned:
+                        print("[JOY] ไม่พบจอยสติ๊กหรืออ่านค่าไม่ได้ — ตรวจ /dev/input/js0 และสิทธิ์ผู้ใช้ (กลุ่ม input)")
+                        no_js_warned = True
+
                     steering = float(joyVal.get('RX', 0.0)) * max_Turning_speed
                     target_throttle = float(joyVal.get('LY', 0.0)) * maxThrottle
 
-                    # ค่อย ๆ ปรับคันเร่ง
+                    # smooth throttle (นุ่ม)
                     if target_throttle > current_throttle:
                         current_throttle = min(current_throttle + throttle_step, target_throttle)
                     elif target_throttle < current_throttle:
                         current_throttle = max(current_throttle - throttle_decay, target_throttle)
 
-                    # ปุ่มบันทึก
+                    # กด B เพื่อบันทึก
                     if int(joyVal.get('B', 0)) == 1:
                         if record == 0:
-                            print('Recording Started ...')
+                            print('[REC] Recording Started ...')
                         record += 1
                         sleep(0.300)
 
@@ -208,26 +164,35 @@ def main():
                         dcM.saveLog()
                         record = 0
 
-                    # ส่งค่าไปมอเตอร์
                     motor.move(current_throttle, steering)
 
                     cv2.waitKey(1)
                     sleep(0.005)
-                    
+
                 except Exception as e:
-                    print(f"Error in main loop: {e}")
+                    print(f"[ERROR] run loop: {e}")
                     break
 
-            # ออกจากลูปย่อยเพราะ OFF หรือ stop_now
-            stop_motor_safely()
-            if not stop_now:
-                print("[SWITCH] OFF -> Waiting for next ON...")
+            # ---------- OFF -> หยุดอย่างปลอดภัย แต่ไม่ทำ motor.cleanup() ----------
+            stop_motor_safely(motor)
+            close_cv_windows_safely()
+            print("[SWITCH] OFF -> Waiting for next ON...")
+
+            # รอจน OFF มั่นคง (กันเด้ง) ก่อนวนไปสเต็ปถัดไป
+            while not exiting and not is_switch_off_stable():
+                sleep(SLEEP_IDLE)
 
     except Exception as e:
-        print(f"Unexpected error in main: {e}")
-    
+        print(f"[FATAL] Unexpected error in main: {e}")
     finally:
-        cleanup_and_exit()
+        try:
+            stop_motor_safely(motor)
+        except Exception:
+            pass
+        close_cv_windows_safely()
+        GPIO.cleanup()
+        print("[SYS] Exit.")
 
 if __name__ == "__main__":
     main()
+
